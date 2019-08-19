@@ -5,5 +5,4 @@
 #
 # Simple batch script that starts SCREEN.
 
-exec screen -Dm -S slurm$SLURM_JOB_ID
-
+exec screen -Dm -S slurm-$SLURM_JOB_ID

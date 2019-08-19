@@ -1,0 +1,252 @@
+#! /bin/sh
+# -*- coding: utf-8 -*-
+#
+# This will submit a batch script that starts screen on a node.
+# Then `ssh -X` is used to connect to the node and attach the screen.
+# The result is very similar to an interactive shell in PBS (qsub -I).
+#
+# This is only useful for older SLURM releases, as SLURM acquired
+# native X11 integration starting version 17.11, see:
+# https://slurm.schedmd.com/faq.html#x11
+#
+# Authors:
+# - Riccardo Murri <riccardo.murri@gmail.com>, reworked UI
+# - Joerg Bornschein <bornschein@fias.uni-frankfurt.de>, made script find own path
+# - Pär Andersson (National Supercomputer Centre, Sweden), initial version
+#
+me="$(basename $0)"
+
+usage () {
+    cat <<EOF
+Usage: $me [options]
+       $me --help
+
+Start an interactive SLURM job with X11 graphical forwarding.
+
+By default, the job is allocated 1 CPU core, 6 hours of run time, and
+4 GB of memory.  If you want to change that, please use the '-c',
+'--time' and '--mem' options; see their meaning and usage in the
+'srun' man page.
+
+Any other option is passed unchanged to the 'srun' SLURM command,
+which see for a catalog of options and their effect.
+
+When given '--help' or '-h' as sole argument, print this usage message.
+
+EOF
+    exit $1
+}
+
+
+## defaults
+
+SESSION_CPU_DEFAULT=1
+SESSION_TIME_DEFAULT=6:00:00
+SESSION_MEM_DEFAULT=4g
+
+
+## helper functions
+
+# see /usr/include/sysexit.h
+EX_OK=0           # successful termination
+EX_USAGE=1        # command line usage error
+EX_DATAERR=65     # data format error
+EX_NOINPUT=66     # cannot open input
+EX_NOUSER=67      # addressee unknown
+EX_NOHOST=68      # host name unknown
+EX_UNAVAILABLE=69 # service unavailable
+EX_SOFTWARE=70    # internal software error
+EX_OSERR=71       # system error (e.g., can't fork)
+EX_OSFILE=72      # critical OS file missing
+EX_CANTCREAT=73   # can't create (user) output file
+EX_IOERR=74       # input/output error
+EX_TEMPFAIL=75    # temp failure; user is invited to retry
+EX_PROTOCOL=76    # remote error in protocol
+EX_NOPERM=77      # permission denied
+EX_CONFIG=78      # configuration error
+
+
+have_command () {
+    command -v "$1" >/dev/null 2>/dev/null
+}
+
+if have_command tput; then
+
+    TXT_NORMAL=$(tput sgr0)
+
+    TXT_BOLD=$(tput bold)
+    TXT_DIM=$(tput dim)
+    TXT_STANDOUT=$(tput smso)
+
+    TXT_BLACK=$(tput setaf 0)
+    TXT_BLUE=$(tput setaf 4)
+    TXT_CYAN=$(tput setaf 6)
+    TXT_GREEN=$(tput setaf 2)
+    TXT_MAGENTA=$(tput setaf 5)
+    TXT_RED=$(tput setaf 1)
+    TXT_WHITE=$(tput setaf 7)
+    TXT_YELLOW=$(tput setaf 3)
+    TXT_NOCOLOR=$(tput op)
+
+    # usage: with_color COLOR TEXT...
+    with_color () {
+        local color="$1";
+        shift;
+
+        local pre="${TXT_NOCOLOR}";
+        local post="${TXT_NOCOLOR}";
+
+        case "$color" in
+            bold*) pre="${TXT_BOLD}";;
+            dim*) pre="${TXT_DIM}";;
+            standout*) pre="${TXT_STANDOUT}";;
+        esac
+
+        case "$color" in
+            *black)       pre="${pre}${TXT_BLACK}";;
+            *blue)        pre="${pre}${TXT_BLUE}";;
+            *cyan)        pre="${pre}${TXT_CYAN}";;
+            *green)       pre="${pre}${TXT_GREEN}";;
+            *magenta)     pre="${pre}${TXT_MAGENTA}";;
+            *red)         pre="${pre}${TXT_RED}";;
+            *white)       pre="${pre}${TXT_WHITE}";;
+            *yellow)      pre="${pre}${TXT_YELLOW}";;
+            none|nocolor) pre="${TXT_NOCOLOR}";;
+        esac
+
+        echo -n "${pre}"; echo -n "$@"; echo "${post}";
+    }
+
+else
+
+    TXT_NORMAL=''
+
+    TXT_BOLD=''
+    TXT_DIM=''
+    TXT_STANDOUT=''
+
+    TXT_BLACK=''
+    TXT_BLUE=''
+    TXT_CYAN=''
+    TXT_GREEN=''
+    TXT_MAGENTA=''
+    TXT_RED=''
+    TXT_WHITE=''
+    TXT_YELLOW=''
+    TXT_NOCOLOR=''
+
+    # ignore any color spec; just echo
+    with_color() {
+        shift; echo "$@";
+    }
+
+fi
+
+die () {
+  rc="$1"
+  shift
+  (
+      echo -n "${TXT_BOLD}$me: ${TXT_RED}ERROR:${TXT_NOCOLOR} ";
+      if [ $# -gt 0 ]; then echo "$@"; else cat; fi
+      echo -n "${TXT_NORMAL}"
+  ) 1>&2
+  exit $rc
+}
+
+warn () {
+    (
+        echo -n "$me: ${TXT_YELLOW}WARNING:${TXT_NOCOLOR} ";
+        if [ $# -gt 0 ]; then echo "$@"; else cat; fi
+    ) 1>&2
+}
+
+require_command () {
+  if ! have_command "$1"; then
+    die 1 "Could not find required command '$1' in system PATH. Aborting."
+  fi
+}
+
+is_absolute_path () {
+    expr match "$1" '/' >/dev/null 2>/dev/null
+}
+
+
+## parse command-line
+
+# since unknown command-line options (and their arguments, if any!)
+# are to be forwarded to `srun`, we cannot use `getopt` here: just
+# honor `--help` if it's the one and only argument on the command
+# line.
+
+if [ $# -eq 1 ]; then
+    if [ "$1" = '--help' ] || [ "$1" = '-h' ]; then
+        usage 0;
+    fi
+fi
+
+
+## main
+
+require_command egrep
+require_command screen
+require_command sbatch
+require_command scancel
+require_command sleep
+require_command squeue
+require_command srun
+
+# Find our own path (linux specific)
+libdir="$( cd "$( dirname "$(readlink -f "$0")" )" && pwd )"
+
+# Batch Script that starts SCREEN
+session="$libdir/${me}-session"
+if ! [ -x "$session" ]; then
+    die $EX_PROTOCOL "Cannot find executable helper script $(basename "$session")"
+fi
+
+# Interactive screen script
+connect="$libdir/${me}-connect"
+if ! [ -x "$connect" ]; then
+    die $EX_PROTOCOL "Cannot find executable helper script $(basename "$connect")"
+fi
+
+
+# Submit the job and get the job id
+job=$(sbatch 2>&1 \
+                    --output=/dev/null --error=/dev/null \
+                    -c $SESSION_CPU_DEFAULT \
+                    --time=$SESSION_TIME_DEFAULT \
+                    --mem=$SESSION_MEM_DEFAULT \
+                    "$@" "$session" \
+          | egrep -o -e "\b[0-9]+$")
+
+# Make sure the job is always canceled
+trap "{ scancel -Q $job; exit; }" EXIT INT TERM ABRT QUIT
+
+echo -n "$(with_color white "${me}:") ${TXT_YELLOW}Waiting up to 5 minutes for JOBID $job to start ..."
+waited=0
+while [ "$waited" -lt 300 ]; do
+    sleep 1s
+
+    # Check job status
+    STATUS=`squeue -j $job -t PD,R -h -o %t`
+
+    if [ "$STATUS" = "R" ];then
+        # Job is running, break the while loop
+        break
+    elif [ "$STATUS" != "PD" ];then
+        scancel $job
+        die $EX_PROTOCOL "SLURM job $job is in neither RUNNING nor PENDING; this is an unexpected situation that I am not prepared to handle."
+    fi
+
+    echo -n "."
+done
+echo "${TXT_NOCOLOR}"
+
+# Determine the first node in the job:
+node=`srun --jobid=$job -N1 hostname`
+
+# SSH to the node and attach the screen
+echo "$(with_color white "${me}:") $(with_color green Connecting to SLURM job $job ...)"
+sleep 1s
+exec ssh -X -t $node "$connect" slurm-$job
